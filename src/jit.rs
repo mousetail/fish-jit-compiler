@@ -1,9 +1,15 @@
 use cranelift::prelude::types::F64;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{DataContext, Linkage, Module};
-use std::collections::HashMap;
-use std::slice;
+use cranelift_module::{DataContext, Module};
+
+pub(crate) struct FunctionInfo {
+    pub(crate) function: fn(*const f64) -> (),
+    pub(crate) stack_consumed: usize,
+    pub(crate) stack_returned: usize,
+}
+
+const STACK_ELEMENT_SIZE: i32 = 8;
 
 pub(crate) struct Jit {
     /// The function builder context, which is reused across multiple
@@ -47,24 +53,51 @@ impl Default for Jit {
 }
 
 impl Jit {
-    pub(crate) fn compile(&mut self, program_fragment: &str) -> *const u8 {
+    pub(crate) fn compile(&mut self, program_fragment: &str) -> FunctionInfo {
         let mut top_of_stack: Vec<Value> = vec![];
+        self.ctx
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(self.module.target_config().pointer_type()));
 
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
         let block = builder.create_block();
+
         builder.append_block_params_for_function_params(block);
         builder.switch_to_block(block);
         builder.seal_block(block);
 
         let mut minimum_starting_stack_size = 0;
 
+        let mut variable_index = 0;
+
+        // builder.block_params(block).push(AbiParam::new(self.module.target_config().pointer_type()));
+        let val = builder.block_params(block)[0];
+        let stack_pointer_variable = Variable::from_u32(0);
+        builder.declare_var(
+            stack_pointer_variable,
+            self.module.target_config().pointer_type(),
+        );
+        builder.def_var(stack_pointer_variable, val);
+        let stack_pointer = builder.use_var(stack_pointer_variable);
         let mut assert_minimum_stack_length =
             |top_of_stack: &mut Vec<Value>, builder: &mut FunctionBuilder, number: usize| {
                 while top_of_stack.len() < number {
+                    // let variable = Variable::from_u32(top_of_stack.len() as u32);
+                    // builder.declare_var(variable, F64);
+                    // top_of_stack.insert(0, builder.use_var(variable))
+                    top_of_stack.insert(
+                        0,
+                        builder.ins().load(
+                            F64,
+                            MemFlags::new(),
+                            stack_pointer,
+                            // If this doesn't work try -2
+                            (-STACK_ELEMENT_SIZE * minimum_starting_stack_size as i32),
+                        ),
+                    );
                     minimum_starting_stack_size += 1;
-                    let variable = Variable::from_u32(top_of_stack.len() as u32);
-                    builder.declare_var(variable, F64);
-                    top_of_stack.insert(0, builder.use_var(variable))
                 }
             };
 
@@ -84,6 +117,40 @@ impl Jit {
                     assert_minimum_stack_length(&mut top_of_stack, &mut builder, 2);
                     if let (Some(a), Some(b)) = (top_of_stack.pop(), top_of_stack.pop()) {
                         top_of_stack.push(builder.ins().fadd(a, b));
+                    }
+                }
+                '*' => {
+                    assert_minimum_stack_length(&mut top_of_stack, &mut builder, 2);
+                    if let (Some(a), Some(b)) = (top_of_stack.pop(), top_of_stack.pop()) {
+                        top_of_stack.push(builder.ins().fmul(a, b));
+                    }
+                }
+                '/' => {
+                    assert_minimum_stack_length(&mut top_of_stack, &mut builder, 2);
+                    if let (Some(a), Some(b)) = (top_of_stack.pop(), top_of_stack.pop()) {
+                        top_of_stack.push(builder.ins().fdiv(a, b));
+                    }
+                }
+                '-' => {
+                    assert_minimum_stack_length(&mut top_of_stack, &mut builder, 2);
+                    if let (Some(a), Some(b)) = (top_of_stack.pop(), top_of_stack.pop()) {
+                        top_of_stack.push(builder.ins().fsub(a, b));
+                    }
+                }
+                '~' => {
+                    assert_minimum_stack_length(&mut top_of_stack, &mut builder, 1);
+                    top_of_stack.pop();
+                }
+                ':' => {
+                    assert_minimum_stack_length(&mut top_of_stack, &mut builder, 1);
+                    if let Some(value) = top_of_stack.pop() {
+                        let var = Variable::from_u32(variable_index + 1);
+                        variable_index += 1;
+                        builder.declare_var(var, F64);
+
+                        builder.def_var(var, value);
+                        top_of_stack.push(builder.use_var(var));
+                        top_of_stack.push(builder.use_var(var));
                     }
                 }
                 '0' => top_of_stack.push(builder.ins().f64const(0.)),
@@ -107,16 +174,21 @@ impl Jit {
         }
         drop(assert_minimum_stack_length);
 
-        builder.ins().return_(&top_of_stack);
+        let final_stack_length = top_of_stack.len();
+        for (index, element) in top_of_stack.into_iter().enumerate() {
+            let var = builder.use_var(stack_pointer_variable);
+
+            builder.ins().store(
+                MemFlags::new(),
+                element,
+                var,
+                -STACK_ELEMENT_SIZE * (minimum_starting_stack_size as i32 - index as i32 - 1),
+            );
+        }
+
+        builder.ins().return_(&[]);
 
         builder.finalize();
-
-        for _ in 0..minimum_starting_stack_size {
-            self.ctx.func.signature.params.push(AbiParam::new(F64));
-        }
-        for _ in 0..top_of_stack.len() {
-            self.ctx.func.signature.returns.push(AbiParam::new(F64));
-        }
 
         let function = self
             .module
@@ -133,6 +205,10 @@ impl Jit {
 
         let code = self.module.get_finalized_function(function);
 
-        return code;
+        return FunctionInfo {
+            function: unsafe { std::mem::transmute::<_, fn(*const f64) -> ()>(code) },
+            stack_returned: final_stack_length,
+            stack_consumed: minimum_starting_stack_size,
+        };
     }
 }
